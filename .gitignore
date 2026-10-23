@@ -1,0 +1,33 @@
+# Rust build output; commit Cargo.lock for this application once generated.
+/target/
+/dist/
+/build/
+/.release-tmp/
+.DS_Store
+
+# Local reverse-engineering inputs and captured evidence.
+/research/
+
+# Signing and local credentials.
+.env
+.env.*
+!.env.example
+*.p12
+*.p8
+*.key
+*.mobileprovision
+*.provisionprofile
+*.keychain
+*.keychain-db
+
+# Runtime clipboard data and debug dumps.
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.dmp
+*.log
+
+# Distribution artifacts belong in GitHub Release assets.
+*.dmg
+*.app/
