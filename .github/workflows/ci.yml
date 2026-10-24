@@ -35,6 +35,8 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Tests
         run: cargo test --locked --all-targets
+      - name: Bounded storage stress
+        run: cargo test --locked --test storage_stress -- --ignored --nocapture
       - name: Package development app and DMG
         run: |
           scripts/build-app.sh aarch64-apple-darwin

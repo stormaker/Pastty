@@ -33,6 +33,7 @@ mkdir -p "$STAGING/content"
 ditto "$APP" "$STAGING/content/Pastty.app"
 ln -s /Applications "$STAGING/content/Applications"
 cp "$ROOT/LICENSE" "$STAGING/content/LICENSE.txt"
+cp "$ROOT/docs/安装与使用.md" "$STAGING/content/安装与使用.txt"
 if [[ "$PUBLIC" == 0 ]]; then
     printf '%s\n' 'Pastty development preview' 'Not notarized for public distribution. Runtime and installation validation may be incomplete.' 'Drag Pastty.app to Applications. This build does not install Rust, Homebrew, or other dependencies.' > "$STAGING/content/DEVELOPMENT-PREVIEW.txt"
 fi
@@ -50,6 +51,7 @@ hdiutil attach -readonly -nobrowse -mountpoint "$STAGING/mount" "$STAGING/$NAME"
 MOUNTED=1
 [[ -x "$STAGING/mount/Pastty.app/Contents/MacOS/pastty" ]] || { echo "DMG contains no executable app." >&2; exit 1; }
 [[ $(readlink "$STAGING/mount/Applications") == /Applications ]] || { echo "Missing Applications shortcut." >&2; exit 1; }
+[[ -s "$STAGING/mount/安装与使用.txt" ]] || { echo "Missing installation instructions." >&2; exit 1; }
 "$ROOT/scripts/verify-release.sh" "$STAGING/mount/Pastty.app"
 hdiutil detach "$STAGING/mount"
 MOUNTED=0

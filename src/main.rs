@@ -10,6 +10,17 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let root = pastty::data_directory()?;
+    let smoke = environment_value("PASTTY_SMOKE_TEST")?;
+    let cycles = environment_value("PASTTY_STRESS_CYCLES")?;
+    if pastty::validate_test_mode(
+        smoke.as_deref(),
+        cycles.as_deref(),
+        std::env::var_os("PASTTY_DATA_DIR").is_some(),
+    )? {
+        let home =
+            std::env::var_os("HOME").ok_or("Cannot determine home directory for test isolation")?;
+        pastty::validate_test_directory(&root, std::path::Path::new(&home))?;
+    }
     pastty::prepare_directory(&root)?;
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true).truncate(false);
@@ -41,6 +52,14 @@ fn run() -> Result<(), String> {
         Ok(())
     } else {
         Err("Native application failed to start".into())
+    }
+}
+
+fn environment_value(key: &str) -> Result<Option<String>, String> {
+    match std::env::var(key) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err("Invalid test environment encoding".into()),
     }
 }
 

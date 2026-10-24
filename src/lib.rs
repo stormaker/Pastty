@@ -11,6 +11,59 @@ static STORE: OnceLock<Mutex<Store>> = OnceLock::new();
 const MAX_INPUT: usize = 16 * 1024 * 1024;
 const MAX_THUMBNAIL: usize = 256 * 1024;
 
+/// Validate opt-in test flags before any application data is opened.
+pub fn validate_test_mode(
+    smoke: Option<&str>,
+    cycles: Option<&str>,
+    explicit_data_dir: bool,
+) -> Result<bool, String> {
+    if smoke.is_none() && cycles.is_none() {
+        return Ok(false);
+    }
+    if smoke != Some("1") || !explicit_data_dir {
+        return Err(
+            "Test mode requires PASTTY_SMOKE_TEST=1 and an explicit isolated data directory".into(),
+        );
+    }
+    if let Some(value) = cycles {
+        if value.is_empty()
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+            || !value
+                .parse::<u32>()
+                .is_ok_and(|number| (1..=10000).contains(&number))
+        {
+            return Err("Stress cycle count must be between 1 and 10000".into());
+        }
+    }
+    Ok(true)
+}
+
+/// Read-only preflight: test runs must use an existing empty private directory.
+pub fn validate_test_directory(path: &Path, home: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err("Test data directory must be absolute".into());
+    }
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|_| "Create a fresh empty test directory first")?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("Test data directory must be a directory, not a symlink".into());
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|_| "Cannot resolve test directory")?;
+    let production = home.join("Library/Application Support/Pastty");
+    let production = std::fs::canonicalize(&production).unwrap_or(production);
+    if canonical.starts_with(production) {
+        return Err("Test mode cannot use the application history directory".into());
+    }
+    if std::fs::read_dir(&canonical)
+        .map_err(|_| "Cannot inspect test directory")?
+        .next()
+        .is_some()
+    {
+        return Err("Test data directory must be empty; existing history is never opened".into());
+    }
+    Ok(())
+}
+
 pub fn data_directory() -> Result<PathBuf, String> {
     if let Some(root) = std::env::var_os("PASTTY_DATA_DIR") {
         let root = PathBuf::from(root);
@@ -217,6 +270,58 @@ pub extern "C" fn pastty_set_hotkey(keycode: u32, modifiers: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn smoke_configuration_requires_explicit_isolation_and_exact_flag() {
+        assert!(validate_test_mode(None, None, false).is_ok());
+        assert!(validate_test_mode(Some("1"), None, true).unwrap());
+        assert!(validate_test_mode(Some("1"), Some("1000"), true).unwrap());
+        for (smoke, cycles, explicit) in [
+            (Some("0"), None, true),
+            (Some("1"), None, false),
+            (None, Some("1000"), true),
+            (Some("1"), Some("0"), true),
+            (Some("1"), Some("10001"), true),
+            (Some("1"), Some("+1"), true),
+            (Some("1"), Some(""), true),
+        ] {
+            assert!(validate_test_mode(smoke, cycles, explicit).is_err());
+        }
+    }
+
+    #[test]
+    fn test_directory_guard_is_read_only_and_rejects_real_history() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("home");
+        let production = home.join("Library/Application Support/Pastty");
+        std::fs::create_dir_all(&production).unwrap();
+        let original = production.join("history.sqlite");
+        std::fs::write(&original, b"untouched user data").unwrap();
+        assert!(validate_test_directory(&production, &home).is_err());
+        assert_eq!(std::fs::read(&original).unwrap(), b"untouched user data");
+        assert_eq!(std::fs::read_dir(&production).unwrap().count(), 1);
+        let child = production.join("empty");
+        std::fs::create_dir(&child).unwrap();
+        assert!(validate_test_directory(&child, &home).is_err());
+        let isolated = temporary.path().join("isolated");
+        std::fs::create_dir(&isolated).unwrap();
+        assert!(validate_test_directory(&isolated, &home).is_ok());
+        assert!(validate_test_directory(&temporary.path().join("missing"), &home).is_err());
+        std::fs::write(isolated.join("existing"), b"keep").unwrap();
+        assert!(validate_test_directory(&isolated, &home).is_err());
+        assert_eq!(std::fs::read(isolated.join("existing")).unwrap(), b"keep");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_directory_guard_rejects_symlink_alias() {
+        let temporary = tempfile::tempdir().unwrap();
+        let actual = temporary.path().join("actual");
+        std::fs::create_dir(&actual).unwrap();
+        let alias = temporary.path().join("alias");
+        std::os::unix::fs::symlink(&actual, &alias).unwrap();
+        assert!(validate_test_directory(&alias, temporary.path()).is_err());
+        assert_eq!(std::fs::read_dir(actual).unwrap().count(), 0);
+    }
     #[test]
     #[cfg(unix)]
     fn directory_setup_rejects_symlink_without_changing_target_permissions() {

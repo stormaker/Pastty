@@ -4,6 +4,7 @@
 #import <ImageIO/ImageIO.h>
 #import <ServiceManagement/ServiceManagement.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <mach/mach.h>
 #import "Pastty.h"
 
 static NSString *const PasttyMarker = @"org.stormaker.pastty.restored";
@@ -16,6 +17,34 @@ static void SmokeCheck(BOOL pass, const char *name) {
     printf("%s %s\n", pass ? "PASS" : "FAIL", name);
     fflush(stdout);
     if (!pass) SmokeResult = 1;
+}
+typedef struct {
+    uint64_t rss;
+    uint64_t physicalFootprint;
+    BOOL valid;
+} PasttyMemorySample;
+static PasttyMemorySample MemorySample(void) {
+    mach_task_basic_info_data_t basic = {0};
+    task_vm_info_data_t vm = {0};
+    mach_msg_type_number_t basicCount = MACH_TASK_BASIC_INFO_COUNT;
+    mach_msg_type_number_t vmCount = TASK_VM_INFO_COUNT;
+    kern_return_t basicResult = task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&basic, &basicCount);
+    kern_return_t vmResult = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &vmCount);
+    return (PasttyMemorySample){basic.resident_size, vm.phys_footprint, basicResult == KERN_SUCCESS && vmResult == KERN_SUCCESS};
+}
+static BOOL ParseStressCycles(NSString *value, NSUInteger *cycles) {
+    *cycles = 0;
+    if (!value) return YES;
+    if (!value.length || value.length > 5) return NO;
+    NSUInteger parsed = 0;
+    for (NSUInteger i = 0; i < value.length; i++) {
+        unichar character = [value characterAtIndex:i];
+        if (character < '0' || character > '9') return NO;
+        parsed = parsed * 10 + character - '0';
+    }
+    if (parsed < 1 || parsed > 10000) return NO;
+    *cycles = parsed;
+    return YES;
 }
 static const uint32_t HotkeySignature = 'Psty';
 static NSEvent *SmokeKeyEvent(NSWindow *window, unsigned short keycode, unichar character) {
@@ -102,6 +131,11 @@ static NSEvent *SmokeKeyEvent(NSWindow *window, unsigned short keycode, unichar 
 @property(nonatomic) BOOL recordingHotkey;
 @property(nonatomic) BOOL hotkeyDown;
 @property(nonatomic) BOOL smoke;
+@property(nonatomic) BOOL stressRunning;
+@property(nonatomic) NSUInteger stressCycles;
+@property(nonatomic) NSUInteger stressCompleted;
+@property(nonatomic) uint64_t stressInitialFootprint;
+@property(nonatomic) uint64_t stressPeakFootprint;
 @property(nonatomic) uint32_t hotkeyCode;
 @property(nonatomic) uint32_t hotkeyModifiers;
 @property(nonatomic) uint32_t hotkeyID;
@@ -198,7 +232,7 @@ static OSStatus HotkeyCallback(EventHandlerCallRef next, EventRef event, void *c
 @implementation PasttyDelegate
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     (void)notification;
-    self.smoke = getenv("PASTTY_SMOKE_TEST") != NULL;
+    self.smoke = [NSProcessInfo.processInfo.environment[@"PASTTY_SMOKE_TEST"] isEqualToString:@"1"];
     self.rows = @[];
     self.thumbnails = [NSMutableDictionary new];
     self.thumbnailCosts = [NSMutableDictionary new];
@@ -206,43 +240,47 @@ static OSStatus HotkeyCallback(EventHandlerCallRef next, EventRef event, void *c
     self.thumbnailViews = NSHashTable.weakObjectsHashTable;
     self.worker = dispatch_queue_create("org.stormaker.pastty.clipboard", DISPATCH_QUEUE_SERIAL);
     self.lastChangeCount = self.smoke ? 0 : NSPasteboard.generalPasteboard.changeCount;
-    EventTypeSpec types[] = {{kEventClassKeyboard, kEventHotKeyPressed}, {kEventClassKeyboard, kEventHotKeyReleased}};
-    InstallEventHandler(GetApplicationEventTarget(), HotkeyCallback, 2, types, (__bridge void *)self, &_eventHandler);
+    if (!self.smoke) {
+        EventTypeSpec types[] = {{kEventClassKeyboard, kEventHotKeyPressed}, {kEventClassKeyboard, kEventHotKeyReleased}};
+        InstallEventHandler(GetApplicationEventTarget(), HotkeyCallback, 2, types, (__bridge void *)self, &_eventHandler);
+    }
     char *saved = pastty_get_hotkey();
     NSDictionary *hotkey = saved ? [NSJSONSerialization JSONObjectWithData:[[NSString stringWithUTF8String:saved] dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil] : nil;
     if (saved) pastty_free_string(saved);
     self.hotkeyCode = hotkey ? [hotkey[@"keycode"] unsignedIntValue] : 9;
     self.hotkeyModifiers = hotkey ? [hotkey[@"modifiers"] unsignedIntValue] : optionKey;
-    BOOL registered = [self registerHotkey:self.hotkeyCode modifiers:self.hotkeyModifiers persist:NO];
+    BOOL registered = self.smoke ? YES : [self registerHotkey:self.hotkeyCode modifiers:self.hotkeyModifiers persist:NO];
     [self updateStatusItem];
     [self buildHistory];
     __weak PasttyDelegate *weakSelf = self;
-    self.keyMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *event) {
-        PasttyDelegate *owner = weakSelf;
-        if (!owner.recordingHotkey) return event;
-        if (event.keyCode == 53) { [owner finishRecording]; return nil; }
-        if (event.isARepeat) return nil;
-        uint32_t modifiers = CarbonModifiers(event.modifierFlags);
-        if (!(modifiers & (cmdKey | optionKey | controlKey)) || (event.keyCode == 9 && modifiers == cmdKey) || event.keyCode == 36 || event.keyCode == 48) {
-            owner.settingsMessage.stringValue = @"请使用 ⌘、⌥ 或 ⌃ 组合键；⌘V 保留给系统粘贴。";
+    if (!self.smoke) {
+        self.keyMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *event) {
+            PasttyDelegate *owner = weakSelf;
+            if (!owner.recordingHotkey) return event;
+            if (event.keyCode == 53) { [owner finishRecording]; return nil; }
+            if (event.isARepeat) return nil;
+            uint32_t modifiers = CarbonModifiers(event.modifierFlags);
+            if (!(modifiers & (cmdKey | optionKey | controlKey)) || (event.keyCode == 9 && modifiers == cmdKey) || event.keyCode == 36 || event.keyCode == 48) {
+                owner.settingsMessage.stringValue = @"请使用 ⌘、⌥ 或 ⌃ 组合键；⌘V 保留给系统粘贴。";
+                return nil;
+            }
+            if ([owner registerHotkey:event.keyCode modifiers:modifiers persist:YES]) {
+                [owner finishRecording];
+                owner.settingsMessage.stringValue = @"快捷键已保存。";
+            } else {
+                owner.settingsMessage.stringValue = @"快捷键已被占用或保存失败，请换一个组合。";
+            }
             return nil;
-        }
-        if ([owner registerHotkey:event.keyCode modifiers:modifiers persist:YES]) {
-            [owner finishRecording];
-            owner.settingsMessage.stringValue = @"快捷键已保存。";
-        } else {
-            owner.settingsMessage.stringValue = @"快捷键已被占用或保存失败，请换一个组合。";
-        }
-        return nil;
-    }];
-    self.outsideMonitor = [NSEvent addGlobalMonitorForEventsMatchingMask:(NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown) handler:^(NSEvent *event) { (void)event; [weakSelf dismissHistory]; }];
-    self.localOutsideMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:(NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown) handler:^NSEvent *(NSEvent *event) {
-        PasttyDelegate *owner = weakSelf;
-        NSStatusBarButton *button = owner.statusItem.button;
-        BOOL onStatusButton = button && event.window == button.window && NSPointInRect([button convertPoint:event.locationInWindow fromView:nil], button.bounds);
-        if (owner.panel.isVisible && event.window != owner.panel && !onStatusButton) [owner dismissHistory];
-        return event;
-    }];
+        }];
+        self.outsideMonitor = [NSEvent addGlobalMonitorForEventsMatchingMask:(NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown) handler:^(NSEvent *event) { (void)event; if (!weakSelf.stressRunning) [weakSelf dismissHistory]; }];
+        self.localOutsideMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:(NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown) handler:^NSEvent *(NSEvent *event) {
+            PasttyDelegate *owner = weakSelf;
+            NSStatusBarButton *button = owner.statusItem.button;
+            BOOL onStatusButton = button && event.window == button.window && NSPointInRect([button convertPoint:event.locationInWindow fromView:nil], button.bounds);
+            if (!owner.stressRunning && owner.panel.isVisible && event.window != owner.panel && !onStatusButton) [owner dismissHistory];
+            return event;
+        }];
+    }
     NSNotificationCenter *workspaceNotifications = NSWorkspace.sharedWorkspace.notificationCenter;
     self.sleepObserver = [workspaceNotifications addObserverForName:NSWorkspaceWillSleepNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) { (void)note; [weakSelf.clipboardTimer invalidate]; weakSelf.clipboardTimer = nil; }];
     self.wakeObserver = [workspaceNotifications addObserverForName:NSWorkspaceDidWakeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) { (void)note; [weakSelf startClipboardTimer]; [weakSelf checkClipboard]; }];
@@ -264,6 +302,7 @@ static OSStatus HotkeyCallback(EventHandlerCallRef next, EventRef event, void *c
     }
 }
 - (BOOL)registerHotkey:(uint32_t)keycode modifiers:(uint32_t)modifiers persist:(BOOL)persist {
+    if (self.smoke) return NO;
     if (self.hotkeyRef && keycode == self.hotkeyCode && modifiers == self.hotkeyModifiers) return YES;
     EventHotKeyRef candidate = NULL;
     uint32_t nextID = self.hotkeyID + 1;
@@ -491,7 +530,8 @@ static OSStatus HotkeyCallback(EventHandlerCallRef next, EventRef event, void *c
     [self checkClipboard];
     [self reloadHistory];
     [self positionHistory];
-    [self.panel makeKeyAndOrderFront:nil];
+    if (self.smoke) [self.panel orderFront:nil];
+    else [self.panel makeKeyAndOrderFront:nil];
     [self.panel makeFirstResponder:self.table];
     self.statusItem.button.highlighted = fromIcon;
 }
@@ -692,8 +732,11 @@ static OSStatus HotkeyCallback(EventHandlerCallRef next, EventRef event, void *c
     [self buildSettings];
     self.iconToggle.state = pastty_get_bool("show_icon", 1) ? NSControlStateValueOn : NSControlStateValueOff;
     [self refreshLoginState];
-    [NSApp activateIgnoringOtherApps:YES];
-    [self.settings makeKeyAndOrderFront:nil];
+    if (self.smoke) [self.settings orderFront:nil];
+    else {
+        [NSApp activateIgnoringOtherApps:YES];
+        [self.settings makeKeyAndOrderFront:nil];
+    }
 }
 - (void)changeIcon:(id)sender {
     (void)sender;
@@ -738,6 +781,30 @@ static OSStatus HotkeyCallback(EventHandlerCallRef next, EventRef event, void *c
 - (void)runSmokeChecks {
     BOOL isolated = NSProcessInfo.processInfo.environment[@"PASTTY_DATA_DIR"].length > 0;
     SmokeCheck(isolated, "isolated-data-directory");
+    NSUInteger cycles = 0;
+    if (!ParseStressCycles(NSProcessInfo.processInfo.environment[@"PASTTY_STRESS_CYCLES"], &cycles)) {
+        SmokeCheck(NO, "stress-cycle-count-must-be-1-to-10000");
+        [self stopSmoke];
+        return;
+    }
+    self.stressCycles = cycles;
+    if (cycles > 0) {
+        NSString *directory = [NSProcessInfo.processInfo.environment[@"PASTTY_DATA_DIR"] stringByResolvingSymlinksInPath];
+        NSString *productionDirectory = [[NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/Pastty"] stringByResolvingSymlinksInPath];
+        // The Rust entry point validates an existing empty isolated directory before
+        // opening Store; do not probe with pastty_list here because listing may evict.
+        if (!isolated || !directory.isAbsolutePath || [directory isEqualToString:productionDirectory]) {
+            SmokeCheck(NO, "stress-requires-fresh-isolated-data-directory");
+            [self stopSmoke];
+            return;
+        }
+        // Exercise real native window lifecycle without flashing 1000 panels onscreen.
+        self.panel.alphaValue = 0;
+        self.panel.ignoresMouseEvents = YES;
+        [self buildSettings];
+        self.settings.alphaValue = 0;
+        self.settings.ignoresMouseEvents = YES;
+    }
     if (isolated) {
         NSArray<NSString *> *fixtures = @[@"Pastty — 简单复制，轻松粘贴", @"https://github.com/stormaker/Pastty", @"文字和图片，只保留需要的内容", @"这是一段较长的文字记录，在菜单中保持单行显示，更多内容会自动省略。", @"第一行\n第二行也能整齐预览"];
         BOOL capturedText = YES;
@@ -788,6 +855,13 @@ static OSStatus HotkeyCallback(EventHandlerCallRef next, EventRef event, void *c
         [self showSettings:nil];
         SmokeCheck(self.settings.isVisible && self.iconToggle && self.loginToggle && self.hotkeyButton, "three-settings-controls");
         SmokeCheck(self.clipboardTimer == nil && self.captureBusy == NO && self.pasteBusy == NO, "smoke-does-not-monitor-or-paste");
+        SmokeCheck(self.hotkeyRef == NULL && self.eventHandler == NULL && self.keyMonitor == nil && self.outsideMonitor == nil && self.localOutsideMonitor == nil, "smoke-has-no-global-hotkey-or-input-monitors");
+    }
+    if (self.stressCycles > 0) {
+        [self.settings orderOut:nil];
+        if (!isolated || SmokeResult != 0) { [self stopSmoke]; return; }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 5), dispatch_get_main_queue(), ^{ [self beginStress]; });
+        return;
     }
     NSTimeInterval hold = MIN(120, MAX(0, [NSProcessInfo.processInfo.environment[@"PASTTY_SMOKE_HOLD_SECONDS"] doubleValue]));
     if (hold > 0 && isolated) {
@@ -798,17 +872,158 @@ static OSStatus HotkeyCallback(EventHandlerCallRef next, EventRef event, void *c
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(hold * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [self stopSmoke]; });
     } else [self stopSmoke];
 }
+- (BOOL)stressLargeImageFixture {
+    NSString *path = [NSBundle.mainBundle pathForResource:@"Pastty" ofType:@"icns"];
+    NSData *icon = path ? [NSData dataWithContentsOfFile:path] : nil;
+    CGImageSourceRef source = icon ? CGImageSourceCreateWithData((__bridge CFDataRef)icon, NULL) : NULL;
+    NSUInteger largestIndex = NSNotFound;
+    uint64_t largestPixels = 0;
+    if (source) {
+        for (size_t i = 0; i < CGImageSourceGetCount(source); i++) {
+            NSDictionary *properties = CFBridgingRelease(CGImageSourceCopyPropertiesAtIndex(source, i, NULL));
+            uint64_t width = [properties[(__bridge NSString *)kCGImagePropertyPixelWidth] unsignedLongLongValue];
+            uint64_t height = [properties[(__bridge NSString *)kCGImagePropertyPixelHeight] unsignedLongLongValue];
+            if (width >= 1024 && height >= 1024 && width <= MaxImagePixels && height <= MaxImagePixels && width <= MaxImagePixels / height && width * height > largestPixels) {
+                largestPixels = width * height;
+                largestIndex = i;
+            }
+        }
+    }
+    CGImageRef bitmap = source && largestIndex != NSNotFound ? CGImageSourceCreateImageAtIndex(source, largestIndex, NULL) : NULL;
+    if (source) CFRelease(source);
+    NSMutableData *encoded = [NSMutableData data];
+    CGImageDestinationRef destination = bitmap ? CGImageDestinationCreateWithData((__bridge CFMutableDataRef)encoded, (__bridge CFStringRef)UTTypePNG.identifier, 1, NULL) : NULL;
+    BOOL encodedImage = NO;
+    if (destination) {
+        CGImageDestinationAddImage(destination, bitmap, NULL);
+        encodedImage = CGImageDestinationFinalize(destination);
+        CFRelease(destination);
+    }
+    if (bitmap) CGImageRelease(bitmap);
+    SmokeCheck(encodedImage && largestPixels >= 1024 * 1024, "stress-bundle-icon-1024-png-fixture");
+    if (!encodedImage) return NO;
+    NSData *original = [encoded copy];
+    NSData *thumbnail = ImageThumbnail(original);
+    CGImageSourceRef thumbSource = thumbnail ? CGImageSourceCreateWithData((__bridge CFDataRef)thumbnail, NULL) : NULL;
+    NSDictionary *thumbProperties = thumbSource ? CFBridgingRelease(CGImageSourceCopyPropertiesAtIndex(thumbSource, 0, NULL)) : nil;
+    if (thumbSource) CFRelease(thumbSource);
+    NSUInteger thumbWidth = [thumbProperties[(__bridge NSString *)kCGImagePropertyPixelWidth] unsignedIntegerValue];
+    NSUInteger thumbHeight = [thumbProperties[(__bridge NSString *)kCGImagePropertyPixelHeight] unsignedIntegerValue];
+    BOOL small = thumbWidth > 0 && thumbHeight > 0 && thumbWidth <= 160 && thumbHeight <= 160;
+    SmokeCheck(small, "stress-large-image-thumbnail-at-most-160-pixels");
+    SmokeCheck([original isEqualToData:encoded], "stress-thumbnail-keeps-original-png-bytes");
+    if (!small || pastty_capture(original.bytes, original.length, NSPasteboardTypePNG.UTF8String, thumbnail.bytes, thumbnail.length) < 0) {
+        SmokeCheck(NO, "stress-large-image-fixture-persisted");
+        return NO;
+    }
+    BOOL matched = NO;
+    char *json = pastty_list();
+    NSArray *history = json ? [NSJSONSerialization JSONObjectWithData:[[NSString stringWithUTF8String:json] dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil] : nil;
+    if (json) pastty_free_string(json);
+    for (NSDictionary *item in history) {
+        if (![item[@"kind"] isEqual:@"image"]) continue;
+        unsigned char *bytes = NULL;
+        size_t length = 0;
+        char *uti = NULL;
+        if (pastty_load([item[@"id"] longLongValue], &bytes, &length, &uti) == 0 && bytes && uti) {
+            matched = length == original.length && memcmp(bytes, original.bytes, length) == 0 && strcmp(uti, NSPasteboardTypePNG.UTF8String) == 0;
+        }
+        if (bytes) pastty_free_data(bytes, length);
+        if (uti) pastty_free_string(uti);
+        if (matched) break;
+    }
+    SmokeCheck(matched, "stress-large-image-roundtrip-preserves-original");
+    return matched && SmokeResult == 0;
+}
+- (void)beginStress {
+    @autoreleasepool {
+        if (!self.smoke || self.stressCycles < 1 || self.stressCycles > 10000 || !NSProcessInfo.processInfo.environment[@"PASTTY_DATA_DIR"].length) {
+            SmokeCheck(NO, "stress-requires-isolated-smoke-mode");
+            [self stopSmoke];
+            return;
+        }
+        self.stressRunning = YES;
+        if (![self stressLargeImageFixture]) { [self stopSmoke]; return; }
+        self.stressCompleted = 0;
+    }
+    // Baseline after fixture creation and its autorelease pool have drained.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 5), dispatch_get_main_queue(), ^{
+        PasttyMemorySample sample = MemorySample();
+        if (!sample.valid) { SmokeCheck(NO, "stress-memory-sampling"); [self stopSmoke]; return; }
+        self.stressInitialFootprint = sample.physicalFootprint;
+        self.stressPeakFootprint = sample.physicalFootprint;
+        printf("PASS stress-memory-sample stage=start rss_bytes=%llu physical_footprint_bytes=%llu\n", (unsigned long long)sample.rss, (unsigned long long)sample.physicalFootprint);
+        printf("PASS stress-start cycles=%lu\n", (unsigned long)self.stressCycles);
+        fflush(stdout);
+        [self runStressCycle];
+    });
+}
+- (void)runStressCycle {
+    @autoreleasepool {
+        [self openHistory:nil];
+        [self.panel displayIfNeeded];
+        [self.table layoutSubtreeIfNeeded];
+        // Force actual reusable view creation, including thumbnail loading, under alpha=0.
+        for (NSUInteger row = 0; row < MIN(self.rows.count, (NSUInteger)8); row++) [self.table viewAtColumn:0 row:row makeIfNecessary:YES];
+        BOOL focused = [self.panel makeFirstResponder:self.table] && self.panel.firstResponder == self.table;
+        if (!self.panel.isVisible || self.rows.count < 2 || !focused || self.table.selectedRow != 0 || self.thumbnailBytes == 0 || self.thumbnailBytes > ThumbnailCacheLimit) {
+            SmokeCheck(NO, "stress-open-layout-focus-and-thumbnail");
+            [self dismissHistory]; [self stopSmoke]; return;
+        }
+        [self.table keyDown:SmokeKeyEvent(self.panel, 125, NSDownArrowFunctionKey)];
+        if (self.table.selectedRow != 1) { SmokeCheck(NO, "stress-down-arrow-selection"); [self dismissHistory]; [self stopSmoke]; return; }
+        [self.table keyDown:SmokeKeyEvent(self.panel, 126, NSUpArrowFunctionKey)];
+        if (self.table.selectedRow != 0) { SmokeCheck(NO, "stress-up-arrow-selection"); [self dismissHistory]; [self stopSmoke]; return; }
+    }
+    // Hand control back to the AppKit run loop between open/render and Esc/teardown.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ [self finishStressCycle]; });
+}
+- (void)finishStressCycle {
+    @autoreleasepool {
+        [self.table keyDown:SmokeKeyEvent(self.panel, 53, 27)];
+        BOOL released = !self.panel.isVisible && self.rows.count == 0 && self.thumbnailBytes == 0 && self.thumbnails.count == 0;
+        for (NSImageView *view in self.thumbnailViews) if (view.image) released = NO;
+        if (!released || self.panel.firstResponder != self.table) {
+            SmokeCheck(NO, "stress-escape-releases-models-and-thumbnails");
+            [self dismissHistory]; [self stopSmoke]; return;
+        }
+        self.stressCompleted++;
+        if (self.stressCompleted % 100 == 0 || self.stressCompleted == self.stressCycles) {
+            PasttyMemorySample sample = MemorySample();
+            if (!sample.valid) { SmokeCheck(NO, "stress-memory-sampling"); [self stopSmoke]; return; }
+            self.stressPeakFootprint = MAX(self.stressPeakFootprint, sample.physicalFootprint);
+            printf("PASS stress-progress completed=%lu total=%lu\n", (unsigned long)self.stressCompleted, (unsigned long)self.stressCycles);
+            fflush(stdout);
+        }
+    }
+    if (self.stressCompleted == self.stressCycles) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 2), dispatch_get_main_queue(), ^{ [self finishStress]; });
+    } else {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self runStressCycle]; });
+    }
+}
+- (void)finishStress {
+    @autoreleasepool {
+        PasttyMemorySample sample = MemorySample();
+        if (!sample.valid) { SmokeCheck(NO, "stress-memory-sampling"); [self stopSmoke]; return; }
+        printf("PASS stress-memory-sample stage=end rss_bytes=%llu physical_footprint_bytes=%llu sampled_peak_physical_footprint_bytes=%llu delta_physical_footprint_bytes=%lld\n", (unsigned long long)sample.rss, (unsigned long long)sample.physicalFootprint, (unsigned long long)MAX(self.stressPeakFootprint, sample.physicalFootprint), (long long)sample.physicalFootprint - (long long)self.stressInitialFootprint);
+        printf("PASS stress-complete cycles=%lu\n", (unsigned long)self.stressCompleted);
+        fflush(stdout);
+        [self stopSmoke];
+    }
+}
 - (void)stopSmoke {
     [self applicationWillTerminate:[NSNotification notificationWithName:NSApplicationWillTerminateNotification object:NSApp]];
     [NSApp stop:nil];
     [NSApp postEvent:[NSEvent otherEventWithType:NSEventTypeApplicationDefined location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:0 context:nil subtype:0 data1:0 data2:0] atStart:NO];
 }
 - (void)handleReopen {
+    if (self.stressRunning) return;
     if (self.smoke && [NSProcessInfo.processInfo.environment[@"PASTTY_SMOKE_VIEW"] isEqualToString:@"history"]) {
         [self.settings orderOut:nil];
         if (!self.panel.isVisible) [self openHistory:nil];
         else {
-            [self.panel makeKeyAndOrderFront:nil];
+            [self.panel orderFront:nil];
             [self.panel makeFirstResponder:self.table];
         }
     } else [self showSettings:nil];
@@ -834,6 +1049,10 @@ static OSStatus HotkeyCallback(EventHandlerCallRef next, EventRef event, void *c
 
 int pastty_run(void) {
     @autoreleasepool {
+        if (NSProcessInfo.processInfo.environment[@"PASTTY_STRESS_CYCLES"] && ![NSProcessInfo.processInfo.environment[@"PASTTY_SMOKE_TEST"] isEqualToString:@"1"]) {
+            SmokeCheck(NO, "stress-requires-smoke-test-equals-1");
+            return SmokeResult;
+        }
         NSApplication *app = NSApplication.sharedApplication;
         [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
         __attribute__((objc_precise_lifetime)) PasttyDelegate *delegate = [PasttyDelegate new];
