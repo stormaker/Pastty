@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>Pastty app icon</title>
+  <desc>A white clipboard outline on a softly dimensional blue macOS app tile. Clipboard geometry follows the user-supplied SVG.</desc>
+  <defs>
+    <linearGradient id="tile" x1="120" y1="80" x2="870" y2="960" gradientUnits="userSpaceOnUse"><stop stop-color="#3987FF"/><stop offset="0.5" stop-color="#236DEB"/><stop offset="1" stop-color="#1646C4"/></linearGradient>
+    <linearGradient id="rim" x1="512" y1="80" x2="512" y2="940" gradientUnits="userSpaceOnUse"><stop stop-color="#FFFFFF" stop-opacity=".38"/><stop offset=".6" stop-color="#FFFFFF" stop-opacity=".04"/><stop offset="1" stop-color="#04215F" stop-opacity=".22"/></linearGradient>
+    <linearGradient id="ink" x1="24" y1="4" x2="24" y2="44" gradientUnits="userSpaceOnUse"><stop stop-color="#FFFFFF"/><stop offset="1" stop-color="#EAF3FF"/></linearGradient>
+    <filter id="shadow" x="-30%" y="-25%" width="160%" height="170%"><feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#061B50" flood-opacity=".19"/></filter>
+    <filter id="glyphShadow" x="-30%" y="-30%" width="160%" height="170%"><feDropShadow dx="0" dy=".65" stdDeviation=".8" flood-color="#0D317A" flood-opacity=".2"/></filter>
+  </defs>
+  <rect x="80" y="80" width="864" height="864" rx="196" fill="url(#tile)" filter="url(#shadow)"/>
+  <rect x="82" y="82" width="860" height="860" rx="194" fill="none" stroke="url(#rim)" stroke-width="4"/>
+  <g transform="translate(176 176) scale(14)" fill="none" stroke="url(#ink)" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round" filter="url(#glyphShadow)">
+    <path d="M17 7H16H10C8.89543 7 8 7.89543 8 9V42C8 43.1046 8.89543 44 10 44H38C39.1046 44 40 43.1046 40 42V9C40 7.89543 39.1046 7 38 7H33.0499H31"/>
+    <rect x="17" y="4" width="14" height="6" fill="#367DEB"/>
+  </g>
+</svg>

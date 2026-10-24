@@ -8,7 +8,7 @@ Read `docs/技术选型研究.md` before implementation or architecture changes.
 
 Implement local text/image clipboard history, normal system Cmd+V, configurable history hotkey (default Option+V), mouse/arrow selection and Enter paste, and Esc dismissal. Settings contain exactly menu-bar icon visibility, history hotkey, and login launch. Reopening the app exposes settings when its icon is hidden; only one process owns clipboard observation and hotkeys.
 
-The selected direction is Rust + objc2/AppKit + SQLite, with image files and bounded thumbnail caches. Resolve remaining API feasibility in a small native prototype. Keep raw clipboard contents out of logs. Preserve original image quality for paste and explicitly bound storage, decoding, queues and cache bytes. Source language alone is not evidence of low memory.
+The implementation uses Rust + a thin Objective-C/AppKit C ABI bridge + SQLite, with image files and bounded thumbnail caches. Rust owns history/configuration; `native/` owns UI and macOS APIs. Keep raw clipboard contents out of logs. Preserve original image quality for paste and explicitly bound storage, decoding, queues and cache bytes. Source language alone is not evidence of low memory.
 
 ## Delivery
 

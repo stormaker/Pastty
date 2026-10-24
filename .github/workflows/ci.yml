@@ -1,0 +1,50 @@
+name: macOS CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-build:
+    name: Apple Silicon development build
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '14.0'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Prepare repository Rust toolchain
+        run: |
+          rustup show
+          rustup component add rustfmt clippy
+          rustc --version --verbose
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Lints
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked --all-targets
+      - name: Package development app and DMG
+        run: |
+          scripts/build-app.sh aarch64-apple-darwin
+          scripts/make-dmg.sh
+      - name: Preserve development build
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: Pastty-arm64-development-${{ github.sha }}
+          path: |
+            dist/*-dev.dmg
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
